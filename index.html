@@ -1,152 +1,197 @@
 <!DOCTYPE html>
 <html>
+
 <head>
-    <title>Remarkable Canvas Experiment</title>
-    <canvas width="1176" height="750" id="canvas-overlay" style="border: 1px solid #aaa; position: absolute; left: 10; right; 10"></canvas>
-    <canvas width="1176" height="750" id="canvas" style="border: 1px solid #aaa; position: absolute; left: 10; right; 10 "></canvas>
+  <title>Remarkable Canvas Experiment</title>
+  <canvas width="1176" height="750" id="canvas-overlay"
+    style="border: 1px solid #aaa; position: absolute; left: 10; right; 10"></canvas>
+  <canvas width="1176" height="750" id="canvas"
+    style="border: 1px solid #aaa; position: absolute; left: 10; right; 10 "></canvas>
 </head>
+
 <body>
-<script>
+  <script>
 
-// Thanks https://github.com/ichaozi/RemarkableFramebuffer
-var MAX_X = 11277;
-var MAX_Y = 7509;
-var RATIO = MAX_X / MAX_Y;
-var MAX_PRESSURE = 4095;
-var MAX_DISPLAY_PRESSURE = 10;
-var RINGBUFFER_SIZE = 10;
+    // Thanks https://github.com/ichaozi/RemarkableFramebuffer
+    var MAX_X = 11277;
+    var MAX_Y = 7509;
+    var RATIO = MAX_X / MAX_Y;
+    var MAX_PRESSURE = 4095;
+    var MAX_DISPLAY_PRESSURE = 10;
+    var RINGBUFFER_SIZE = 10;
 
-// landscape / portrait
-var rotate = false;
+    // landscape / portrait
+    var rotate = false;
 
-var canvas = document.getElementById("canvas");
-var ctx = canvas.getContext("2d");
+    var canvas = document.getElementById("canvas");
+    var ctx = canvas.getContext("2d");
 
-var canvasOverlay = document.getElementById("canvas-overlay");
-var ctxOverlay = canvasOverlay.getContext("2d");
+    var canvasOverlay = document.getElementById("canvas-overlay");
+    var ctxOverlay = canvasOverlay.getContext("2d");
 
-// Stroke only for drawing, fill only for debug.
-ctx.lineWidth = 2;
+    // Stroke only for drawing, fill only for debug.
+    ctx.lineWidth = 2;
+    var is_erasing = false;
+    let websocket = new WebSocket("ws://" + location.host + "/websocket");
 
-let websocket = new WebSocket("ws://" + location.host + "/websocket");
+    let scaleX = canvas.width / MAX_X / 2;
+    let scaleY = canvas.height / MAX_Y / 2;
+    let scalePressure = MAX_DISPLAY_PRESSURE / MAX_PRESSURE;
 
-let scaleX = canvas.width / MAX_X / 2;
-let scaleY = canvas.height / MAX_Y / 2;
-let scalePressure = MAX_DISPLAY_PRESSURE / MAX_PRESSURE;
+    let penState = false;
 
-let penState = false;
+    // Ring buffer to smooth out values.
+    let ringbufferX = new Float64Array(RINGBUFFER_SIZE);
+    let ringbufferY = new Float64Array(RINGBUFFER_SIZE);
+    let ringbufferZ = new Float64Array(RINGBUFFER_SIZE);
 
-// Ring buffer to smooth out values.
-let ringbufferX = new Float64Array(RINGBUFFER_SIZE);
-let ringbufferY = new Float64Array(RINGBUFFER_SIZE);
-let ringbufferZ = new Float64Array(RINGBUFFER_SIZE);
 
-let rbI = 0;
+    let rbI = 0;
 
-let debug = false;
+    let debug = false;
 
-let lastX = null;
-let lastY = null;
+    let lastX = null;
+    let lastY = null;
+    
+    // Function to map pressure to line width (min thickness 1px, max 10px)
+    function getLineWidth(pressure) {
+      let minThickness = 1;
+      let maxThickness = 10;
+      // let lineWidth = (pressure / 4095) * (maxThickness);
+      let lineWidth = (pressure / 4095) * (maxThickness - minThickness) + minThickness;
 
-function draw() {
-  // Loop through ringbuffer elements...
-  // Average all ringbuffer elements where the pressure is nonzeroish.
-  let avgX = 0;
-  let avgY = 0;
-  let cnt = 0;
-  for (i = 0; i < RINGBUFFER_SIZE; i++) {
-    // If this does look like the end of a stroke, still use the whole
-    // framebuffer. It's short enough to drain quickly without confusing
-    // this stroke with the next.
-    if (ringbufferZ[i] > 10) {
-      avgX += ringbufferX[i];
-      avgY += ringbufferY[i];
-      cnt += 1;
+      // Clamp the line width to be within the min and max thickness
+      return Math.max(minThickness, Math.min(lineWidth, maxThickness));
+      return lineWidth;
     }
-  }
 
-  avgX /= cnt;
-  avgY /= cnt;
-  avgX *= scaleX;
-  avgY *= scaleY;
+    function draw() {
+      let avgX = 0, avgY = 0, cnt = 0;
+      
+      // Calculate average position for smoothing
+      for (let i = 0; i < RINGBUFFER_SIZE; i++) {
+        if (ringbufferZ[i] > 10) {  // pressure threshold
+          avgX += ringbufferX[i];
+          avgY += ringbufferY[i];
+          cnt += 1;
+        }
+      }
 
- // If there were zero entries with nonzero pressure, that's the
- // end of a stroke. Forget the last point.
- if (cnt == 0) {
-    penState = false;
-    lastX = null;
-    lastY = null;
-  } else {
-    // Only start drawing if we already started a line.
-    if (penState) {
-        ctx.lineWidth = 2;
+      avgX /= cnt;
+      avgY /= cnt;
+      avgX *= scaleX;
+      avgY *= scaleY;
+
+      if (cnt === 0) {
+        penState = false;
+        lastX = null;
+        lastY = null;
+      } else {
+        let lineWidth = getLineWidth(ringbufferZ[rbI]);  // Get thickness based on pressure
+        debug && console.log('Pressure:', ringbufferZ[rbI], 'Line Width:', lineWidth);
+        if (penState) {
+          ctx.lineWidth = lineWidth;  // Apply pressure-based thickness
+          ctx.beginPath();
+          ctx.moveTo(lastX, lastY);
+          ctx.lineTo(avgX, avgY);
+          ctx.stroke();
+        }
+        penState = true;
+        lastX = avgX;
+        lastY = avgY;
+      }
+    }
+
+    function erase() {
+    // Get the most recent valid pressure value
+      let currentPressure = ringbufferZ[rbI];  // Use the most recent pressure value directly
+      if (currentPressure > 10) {  // Ensure there's enough pressure to erase
+          let avgX = ringbufferX[rbI] * scaleX;
+          let avgY = ringbufferY[rbI] * scaleY;
+
+          let eraserSize = 30;  // Eraser size
+          ctx.clearRect(avgX - eraserSize / 2, avgY - eraserSize / 2, eraserSize, eraserSize);
+          penState = true; // Set pen state to true while erasing
+          lastX = avgX;
+          lastY = avgY;
+      } else {
+          penState = false;  // No erasing if pressure is low
+      }
+    }
+
+    lastX = null, lastY = null;
+    let drawing = false;
+
+    function overlay(x, y) {
+        ctxOverlay.clearRect(0, 0, canvasOverlay.width, canvasOverlay.height);  // Clear entire overlay
+        ctxOverlay.fillStyle = "rgba(200, 200, 255, 0.5)";  // Use semi-transparent color
+        ctxOverlay.beginPath();
+        ctxOverlay.arc(x, y, 10, 0, 2 * Math.PI);
+        ctxOverlay.fill();
+    }
+
+
+    // Throttle the drawing/erasing to happen at the next animation frame
+    function handleDrawOrErase() {
+      if (!drawing) {
+        drawing = true;
+        requestAnimationFrame(() => {
+          if (is_erasing === 'draw') {
+            draw();
+          } else if (is_erasing === 'erase') {
+            
+            erase();
+          }
+          drawing = false; // Reset flag after drawing
+        });
+      }
+    }
+
+    websocket.onmessage = function (event) {
+      let data = JSON.parse(event.data);
+
+      // Pre-increment rbI for the ring buffer
+      rbI = (rbI + 1) % RINGBUFFER_SIZE;
+      ringbufferX[rbI] = data.x;
+      ringbufferY[rbI] = data.y;
+      ringbufferZ[rbI] = data.pressure;
+      is_erasing = data.mode;
+
+      let scaledX = data.x * scaleX;
+      let scaledY = data.y * scaleY;
+
+      overlay(scaledX, scaledY);
+      handleDrawOrErase();
+
+      if (debug) {
+        ctx.fillStyle = "red";
         ctx.beginPath();
-        ctx.moveTo(lastX, lastY);
-        ctx.lineTo(avgX, avgY);
-        ctx.stroke();
-     }
-     penState = true;
-
-    // Always assign last x and y when there's pen pressure,
-    // to mark the start of a line.
-    lastX = avgX;
-    lastY = avgY;
-  }
-}
+        ctx.fillRect(scaledX, scaledY, 2, 2);
+        ctx.fill();
+      }
+    };
 
 
-function overlay(x, y) {
-  // Clear when hovering, but keep drawing for the duration of a stroke to highlight it.
-  if (!penState) {
-    ctxOverlay.clearRect(0,0,canvasOverlay.width,canvasOverlay.height);  
-  }
-  ctxOverlay.fillStyle = "rgb(200, 200, 255)";
-  ctxOverlay.beginPath();
-  ctxOverlay.arc(x, y, 10, 0, 2 * Math.PI);
-  ctxOverlay.fill();
-}
-websocket.onmessage = function(event) {
-  // data is [x, y, pressure]
-  let data = JSON.parse(event.data);
+    document.addEventListener('keydown', logKey);
 
-  // Pre-increment rbI so we can use it in draw to refer to the current head.
-  rbI = (rbI + 1) % RINGBUFFER_SIZE;
-  ringbufferX[rbI] = data[0];
-  ringbufferY[rbI] = data[1];
-  ringbufferZ[rbI] = data[2];
+    function logKey(e) {
+      if (e.keyCode == 13) {
+        // enter for rotate
+        rotate = !rotate;
 
-  overlay(data[0] * scaleX,  data[1] * scaleY);
-
-  draw();
-
-  if (debug) {
-    ctx.fillStyle = "red";
-    ctx.beginPath();
-    ctx.fillRect(data[0] * scaleX, data[1] * scaleY, 2, 2);
-    ctx.fill();
-  }
-
-};
-
-document.addEventListener('keydown', logKey);
-
-function logKey(e) {
-  if (e.keyCode == 13) {
-    // enter for rotate
-    rotate = !rotate;
-
-    let oldWidth = canvas.width;
-    canvas.width = canvas.height;
-    canvas.height = oldWidth
-  } else if (e.keyCode == 32) {
-    // Space for clear.
-    canvas.width = canvas.width;
-    e.preventDefault();
-  } else if (e.keyCode == 68) {
-    // 'd' for debug
-    debug = !debug;
-  }
-}
-</script>
+        let oldWidth = canvas.width;
+        canvas.width = canvas.height;
+        canvas.height = oldWidth
+      } else if (e.keyCode == 32) {
+        // Space for clear.
+        canvas.width = canvas.width;
+        e.preventDefault();
+      } else if (e.keyCode == 68) {
+        // 'd' for debug
+        debug = !debug;
+      }
+    }
+  </script>
 </body>
+
 </html>
